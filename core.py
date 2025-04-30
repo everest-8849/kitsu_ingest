@@ -56,15 +56,31 @@ def sort_dataframe(df):
 
     return df.copy()
 
+def fetch_csv_from_folder(path):
+    if os.path.isdir(path):
+        csv_files = sorted(
+            f for f in os.listdir(path)
+            if f.lower().endswith('.csv') and os.path.isfile(os.path.join(path, f))
+        )
+
+        if not csv_files:
+            raise FileNotFoundError(f"[fetch_csv_from_folder] No .csv files found in directory: {path}")
+
+        return os.path.join(path, csv_files[0])
+
+    else:
+        raise FileNotFoundError(f"[fetch_csv_from_folder] Path does not exist: {path}")
+
+
 
 class KitsuIngest:
-    def __init__(self, csv_path=None, video_path=None, project_name=None, new_version=None, sequence=None):
+    def __init__(self, csv_path=None, video_path=None, project_name=None, push_only=None, sequence=None):
         # INPUTS
         self.csv_path = csv_path
         self.video_path = video_path
         self.kitsu_project = project_name
-        self.new_version = new_version
         self.sequence = sequence
+        self.push_only = push_only
 
         # OPEN CSV, SORT BY SHOT NAME COLUMN
         self.df_obj = pd.read_csv(self.csv_path)
@@ -79,14 +95,15 @@ class KitsuIngest:
         self.processed_csv_path = ""
 
         # PROCESSING
-        if self.csv_path:
+        if self.push_only:
+           self.processed_csv_path = fetch_csv_from_folder(self.push_only)
+           self.output_dir = self.push_only
+        elif self.csv_path:
             self.process_csv()
         if self.csv_path and self.video_path:
             self.process_video()
         # PUSHING WORKFLOW
-        if self.kitsu_project and self.new_version:
-            self.push_to_kitsu()
-        elif self.kitsu_project:
+        if self.kitsu_project:
             self.push_to_kitsu()
 
     def process_csv(self):
@@ -256,16 +273,18 @@ def main():
     parser.add_argument('--csv', required=True, help='Path to the breakdown CSV file')
     parser.add_argument('-v', '--video', help='Path to the breakdown video file')
     parser.add_argument('-p', '--push', metavar='PROJECT', help='Project name to push to Kitsu')
-    parser.add_argument('-nv', '--new_version', action='store_true',
-                        help='Push as a new version (requires --push)')
+    parser.add_argument('--push_only', help='Push a folder (path) containing CSV and videos to Kitsu')
     parser.add_argument('--sequence', default='SQ01', help='Sequence name to assign to all shots')
 
     args = parser.parse_args()
 
-    if args.new_version and not args.push:
-        parser.error("--new_version requires --push to be specified")
+    if args.push_only and (args.csv or args.video):
+        parser.error("--push_only can only be used with --push PROJECT and --sequence NAME arguments")
 
-    ingest = KitsuIngest(args.csv, args.video, args.push, args.new_version, args.sequence)
+    if args.push_only and not args.push:
+        parser.error("--push_only requires --push PROJECT argument")
+
+    ingest = KitsuIngest(args.csv, args.video, args.push, args.push_only, args.sequence)
     ingest.close()
 
 
