@@ -43,6 +43,7 @@ def extract_shots(df):
 
     return shot_info
 
+
 def sort_dataframe(df):
     df['SHOT'] = df['SHOT'].astype(str)
 
@@ -61,6 +62,7 @@ def sort_dataframe(df):
     df = df.drop(columns=['sort_prefix', 'sort_number'])
 
     return df.copy()
+
 
 # Fetch the last modified CSV file from a directory
 def fetch_csv_from_folder(path):
@@ -81,6 +83,103 @@ def fetch_csv_from_folder(path):
         raise FileNotFoundError(f"[fetch_csv_from_folder] Path does not exist: {path}")
 
 
+def kitsu_login():
+    load_dotenv()
+    kitsu_server = os.getenv('KITSU_SERVER')
+    kitsu_email = os.getenv('KITSU_EMAIL')
+    kitsu_password = os.getenv('KITSU_PASSWORD')
+
+    if not all([kitsu_server, kitsu_email, kitsu_password]):
+        raise EnvironmentError("Missing one of KITSU_SERVER, KITSU_EMAIL, or KITSU_PASSWORD in .env")
+
+    logging.info(f"Connecting to Kitsu server: {kitsu_server}")
+    try:
+        gazu.set_host(kitsu_server)
+        gazu.log_in(kitsu_email, kitsu_password)
+    except Exception as e:
+        raise RuntimeError("Kitsu login failed. Check your credentials or host address.") from e
+
+
+def fetch_shot_name_from_tasks(all_tasks):
+    shot_task_map = {}
+    for task in all_tasks:
+        entity_id = task.get("entity_id")
+        if not entity_id:
+            continue
+        entity = gazu.entity.get_entity(entity_id)
+        if entity:
+            shot_task_map[entity["name"]] = task
+    return shot_task_map
+
+
+def safety_check_kitsu_vs_local_mp4(kitsu_data, mp4_files):
+    shots_names_from_sequence = set(kitsu_data.keys())
+    mp4_shot_names = {os.path.splitext(f)[0] for f in mp4_files}
+
+    matching = shots_names_from_sequence & mp4_shot_names
+    missing_in_files = shots_names_from_sequence - mp4_shot_names
+    extra_in_files = mp4_shot_names - shots_names_from_sequence
+
+    logging.info(f"Total shots in Kitsu: {len(shots_names_from_sequence)}")
+    logging.info(f"Total MP4 files: {len(mp4_shot_names)}")
+    logging.info(f"Matching shot names: {len(matching)}")
+
+    if missing_in_files:
+        logging.warning(f"Shots missing corresponding MP4s: {sorted(missing_in_files)}")
+    if extra_in_files:
+        logging.warning(f"Extra MP4 files without matching shots: {sorted(extra_in_files)}")
+
+    if missing_in_files or extra_in_files:
+        ask_user_input()
+
+
+def safety_check_matching_metadata(kitsu_data, local_data):
+    mismatches = {}
+    for name, csv_data in local_data.items():
+        shot = kitsu_data.get(name)
+        if not shot:
+            mismatches[name] = {"error": "Missing in Kitsu shots"}
+            continue
+
+        diffs = {
+            k: {"csv": v, "kitsu": shot[k]}
+            for k, v in csv_data.items()
+            if (
+                isinstance(v, float) and not abs(v - shot[k]) < 1e-3
+            ) or (
+                not isinstance(v, float) and v != shot[k]
+            )
+        }
+
+        if diffs:
+            mismatches[name] = diffs
+
+    for name in kitsu_data:
+        if name not in local_data:
+            mismatches[name] = {"error": "Missing in CSV shots"}
+
+    # Summary
+    if mismatches:
+        logging.warning("Metadata mismatches detected:")
+        for name, diff in mismatches.items():
+            print(f"\nShot: {name}")
+            for k, v in diff.items():
+                if isinstance(v, dict):
+                    print(f"  {k}: CSV={v['csv']} | Kitsu={v['kitsu']}")
+                else:
+                    print(f"  {k}: {v}")
+        ask_user_input()
+    else:
+        logging.info("All metadata matches between CSV and Kitsu.")
+
+
+def ask_user_input():
+    response = input("continue? (y/N): ").strip().lower()
+    if response not in ("y", "yes"):
+        logging.info("Ingest aborted by user.")
+        exit(0)
+
+
 class KitsuIngest:
     def __init__(self, csv_path=None, video_path=None, project_name=None, push_only=None, sequence=None):
         # INPUTS
@@ -90,29 +189,32 @@ class KitsuIngest:
         self.sequence = sequence
         self.push_only = push_only
 
-        # OPEN CSV, SORT BY SHOT NAME COLUMN
-        self.df_obj = pd.read_csv(self.csv_path)
-        self.df_obj = sort_dataframe(self.df_obj)
-        # RENAME SHOTS FROM CSV
-        self.df_obj.loc[:, 'final_shot_name'] = self.df_obj['SHOT'].apply(
-            lambda shot: '_'.join(str(shot).split('_')[:2])
-        )
-
         # INIT
         self.output_dir = ""
         self.processed_csv_path = ""
         self.timestamp = ""
+        self.kitsu_data = None
+        self.local_data = None
 
         # PROCESSING
         if self.push_only:
            self.processed_csv_path = fetch_csv_from_folder(self.push_only)
            self.output_dir = self.push_only
+           print(f"[push_only] Using CSV: {self.processed_csv_path}")
         else:
+            # OPEN CSV, SORT BY SHOT NAME COLUMN
+            self.df_obj = pd.read_csv(self.csv_path)
+            self.df_obj = sort_dataframe(self.df_obj)
+            # RENAME SHOTS FROM CSV
+            self.df_obj.loc[:, 'final_shot_name'] = self.df_obj['SHOT'].apply(
+                lambda shot: '_'.join(str(shot).split('_')[:2])
+            )
             self.build_output_dir()
         if self.csv_path:
             self.process_csv()
         if self.video_path and self.csv_path:
             self.process_video()
+
         # PUSHING WORKFLOW
         if self.kitsu_project:
             self.push_to_kitsu()
@@ -124,6 +226,31 @@ class KitsuIngest:
         processed_dir_timestamp = os.path.join(processed_dir, self.timestamp)
         os.makedirs(processed_dir_timestamp, exist_ok=True)
         self.output_dir = processed_dir_timestamp
+
+    def build_data_dicts(self, shots_from_sequence, processed_csv_path):
+        self.kitsu_data = {
+            shot["name"]: {
+                "frame_in": int(shot["data"].get("frame_in", 0)),
+                "frame_out": int(shot["data"].get("frame_out", 0)),
+                "nb_frames": shot.get("nb_frames", 0),
+                "fps": float(shot["data"].get("fps", 0.0)),
+                "description": shot.get("description", "")
+            }
+            for shot in shots_from_sequence
+        }
+
+        df = pd.read_csv(processed_csv_path)
+        self.local_data = {
+            row["Name"]: {
+                "frame_in": int(row["Frame In"]),
+                "frame_out": int(row["Frame Out"]),
+                "nb_frames": int(row["Nb Frames"]),
+                "fps": float(row["FPS"]),
+                "description": row["Description"]
+            }
+            for _, row in df.iterrows()
+        }
+
 
     def process_csv(self):
         df = self.df_obj.copy(deep=True)
@@ -192,20 +319,7 @@ class KitsuIngest:
             last_frame = end_frame
 
     def push_to_kitsu(self):
-        load_dotenv()
-        kitsu_server = os.getenv('KITSU_SERVER')
-        kitsu_email = os.getenv('KITSU_EMAIL')
-        kitsu_password = os.getenv('KITSU_PASSWORD')
-
-        if not all([kitsu_server, kitsu_email, kitsu_password]):
-            raise EnvironmentError("Missing one of KITSU_SERVER, KITSU_EMAIL, or KITSU_PASSWORD in .env")
-
-        logging.info(f"Connecting to Kitsu server: {kitsu_server}")
-        try:
-            gazu.set_host(kitsu_server)
-            gazu.log_in(kitsu_email, kitsu_password)
-        except Exception as e:
-            raise RuntimeError("Kitsu login failed. Check your credentials.") from e
+        kitsu_login()
 
         try:
             project = gazu.project.get_project_by_name(self.kitsu_project)
@@ -216,26 +330,29 @@ class KitsuIngest:
         logging.info("Importing shots from CSV...")
         gazu.shot.import_shots_with_csv(project, self.processed_csv_path)
 
-        logging.info(f"Fetching tasks for {TASK_TYPE_NAME}...")
+        logging.info(f"Fetching data from Kitsu...")
         task_type = gazu.task.get_task_type_by_name(TASK_TYPE_NAME)
         task_status = gazu.task.get_task_status_by_name(TASK_STATUS_NAME)
+        sequence = gazu.shot.get_sequence_by_name(project, self.sequence)
+        shots_from_sequence = gazu.shot.all_shots_for_sequence(sequence)
         all_tasks = gazu.task.all_tasks_for_project(project, task_type)
+        shot_task_map = fetch_shot_name_from_tasks(all_tasks)
 
-        shot_task_map = {}
-        for task in all_tasks:
-            entity_id = task.get("entity_id")
-            if not entity_id:
-                continue
-            entity = gazu.entity.get_entity(entity_id)
-            if entity:
-                shot_task_map[entity["name"]] = task
-
-        logging.info(f"Mapped {len(shot_task_map)} shots to Kitsu tasks.")
-
+        logging.info(f"Fetching data from local folder...")
         mp4_files = [f for f in os.listdir(self.output_dir) if f.endswith(".mp4")]
+
+        # Build data dictionaries
+        self.build_data_dicts(shots_from_sequence, self.processed_csv_path)
+
+        # Safety check
+        safety_check_kitsu_vs_local_mp4(self.kitsu_data, mp4_files)
+        safety_check_matching_metadata(self.kitsu_data, self.local_data)
+        #####
+        # DO SHOT NAME CHECK
+        ####
+
         unmatched_count = 0
         failed_count = 0
-
         for file_name in mp4_files:
             shot_name = os.path.splitext(file_name)[0]
             task = shot_task_map.get(shot_name)
@@ -246,6 +363,11 @@ class KitsuIngest:
                 continue
 
             video_path = os.path.join(self.output_dir, file_name)
+            if not os.path.exists(video_path):
+                logging.warning(f"Video file not found: {video_path}")
+                unmatched_count += 1
+                continue
+
             logging.info(f"Publishing preview for: {shot_name}")
 
             try:
