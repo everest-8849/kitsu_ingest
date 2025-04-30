@@ -1,18 +1,28 @@
-from dotenv import load_dotenv
+import os
 from datetime import datetime
-import pandas as pd
 import argparse
+
+import pandas as pd
 import ffmpeg
 import gazu
-import os
+from dotenv import load_dotenv
 
 # USES PYTHON 3.9 AS AYON
 # NEED THE DEPENDENCIES:
 # pip install ffmpeg-python pandas gazu python-dotenv argparse
 # NEEDS .env FILE WITH KITSU_SERVER, KITSU_EMAIL, KITSU_PASSWORD
 
+TASK_TYPE_NAME = "From EVEREST"
+TASK_STATUS_NAME = "Done"
+
+
 def extract_shots(df):
-    df = df[['final_shot_name', 'FRAME DURATION', 'FPS']]
+    required_cols = ['final_shot_name', 'FRAME DURATION', 'FPS']
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in CSV: {', '.join(missing)}")
+
+    df = df[['final_shot_name', 'FRAME DURATION', 'FPS']].copy()
     df.columns = ['final_shot_name', 'frame_length', 'fps']
 
     df['frame_length'] = pd.to_numeric(df['frame_length'], errors='coerce')
@@ -44,39 +54,43 @@ def sort_dataframe(df):
     # Drop the helper columns
     df = df.drop(columns=['sort_prefix', 'sort_number'])
 
-    return df
+    return df.copy()
 
 
 class KitsuIngest:
-    def __init__(self, csv_path=None, video_path=None, project_name=None):
+    def __init__(self, csv_path=None, video_path=None, project_name=None, new_version=None, sequence=None):
         # INPUTS
         self.csv_path = csv_path
         self.video_path = video_path
         self.kitsu_project = project_name
+        self.new_version = new_version
+        self.sequence = sequence
 
         # OPEN CSV, SORT BY SHOT NAME COLUMN
         self.df_obj = pd.read_csv(self.csv_path)
         self.df_obj = sort_dataframe(self.df_obj)
-
         # RENAME SHOTS FROM CSV
-        self.df_obj['final_shot_name'] = self.df_obj['SHOT'].apply(
+        self.df_obj.loc[:, 'final_shot_name'] = self.df_obj['SHOT'].apply(
             lambda shot: '_'.join(str(shot).split('_')[:2])
         )
 
+        # INIT
         self.output_dir = ""
+        self.processed_csv_path = ""
 
-        # PROCESSED
-        self.processed_csv_path = None
-
+        # PROCESSING
         if self.csv_path:
             self.process_csv()
         if self.csv_path and self.video_path:
             self.process_video()
-        if self.kitsu_project:
+        # PUSHING WORKFLOW
+        if self.kitsu_project and self.new_version:
+            self.push_to_kitsu()
+        elif self.kitsu_project:
             self.push_to_kitsu()
 
     def process_csv(self):
-        df = self.df_obj.copy()
+        df = self.df_obj.copy(deep=True)
 
         rename_mapping = {
             'final_shot_name': 'Name',
@@ -86,13 +100,16 @@ class KitsuIngest:
             'Clip Name': 'Description'
         }
 
+        missing_cols = [col for col in rename_mapping if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns for rename: {missing_cols}")
+
         df.rename(columns=rename_mapping, inplace=True)
-        df['Sequence'] = 'SQ01'
+        df['Sequence'] = self.sequence
         columns_to_keep = ['Sequence'] + list(rename_mapping.values()) + ['FPS']
         df = df[columns_to_keep]
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
         processed_dir = os.path.join(os.path.dirname(__file__), 'processed')
         os.makedirs(processed_dir, exist_ok=True)
         processed_dir_timestamp = os.path.join(processed_dir, timestamp)
@@ -106,10 +123,10 @@ class KitsuIngest:
         self.processed_csv_path = output_path
 
     def process_video(self):
-        df = self.df_obj.copy()
+        df = self.df_obj.copy(deep=True)
         shots = extract_shots(df)
 
-        input = ffmpeg.input(self.video_path)
+        input_stream  = ffmpeg.input(self.video_path)
 
         last_frame = 0
 
@@ -118,7 +135,7 @@ class KitsuIngest:
             end_frame = last_frame + length
 
             trimmed = (
-                input.video
+                input_stream.video
                 .trim(start_frame=start_frame, end_frame=end_frame)
                 .setpts('PTS-STARTPTS')  # Reset timestamps
             )
@@ -147,7 +164,6 @@ class KitsuIngest:
 
     def push_to_kitsu(self):
         load_dotenv()
-
         kitsu_server = os.getenv('KITSU_SERVER')
         kitsu_email = os.getenv('KITSU_EMAIL')
         kitsu_password = os.getenv('KITSU_PASSWORD')
@@ -156,8 +172,11 @@ class KitsuIngest:
             raise EnvironmentError("Missing one of KITSU_SERVER, KITSU_EMAIL, or KITSU_PASSWORD environment variables.")
 
         print(f"Connecting to Kitsu server: {kitsu_server}")
-        gazu.set_host(kitsu_server)
-        gazu.log_in(kitsu_email, kitsu_password)
+        try:
+            gazu.set_host(kitsu_server)
+            gazu.log_in(kitsu_email, kitsu_password)
+        except Exception as e:
+            raise RuntimeError("Kitsu login failed. Check your credentials.") from e
 
         try:
             project = gazu.project.get_project_by_name(self.kitsu_project)
@@ -169,8 +188,8 @@ class KitsuIngest:
         gazu.shot.import_shots_with_csv(project, self.processed_csv_path)
 
         print("Fetching tasks...")
-        task_type = gazu.task.get_task_type_by_name("From EVEREST")
-        task_status = gazu.task.get_task_status_by_name("Done")
+        task_type = gazu.task.get_task_type_by_name(TASK_TYPE_NAME)
+        task_status = gazu.task.get_task_status_by_name(TASK_STATUS_NAME)
         from_everest_tasks = gazu.task.all_tasks_for_project(project, task_type)
 
         shot_task_map = {}
@@ -191,8 +210,7 @@ class KitsuIngest:
 
         for file_name in os.listdir(self.output_dir):
             if file_name.endswith(".mp4"):
-                shot_base_name = os.path.splitext(file_name)[0]  # e.g., SHOT_0030
-                print(f"Processing file: {file_name} with base name: {shot_base_name}")
+                shot_base_name = os.path.splitext(file_name)[0] # remove ext
                 task = shot_task_map.get(shot_base_name)
 
                 if task:
@@ -204,7 +222,7 @@ class KitsuIngest:
                         comment = gazu.task.add_comment(
                             task=task,
                             task_status=task_status,
-                            comment="Auto-published preview from ingest script."
+                            comment="Auto-published preview."
                         )
 
                         preview = gazu.task.add_preview(
@@ -215,8 +233,6 @@ class KitsuIngest:
                         )
 
                         gazu.task.set_main_preview(preview)
-
-                        # print(f"✔️ Published preview for {shot_base_name}")
 
                     except Exception as e:
                         print(f"Warning: Failed to publish preview for {shot_base_name}: {e}")
@@ -236,15 +252,26 @@ class KitsuIngest:
 
 def main():
     parser = argparse.ArgumentParser(description='Kitsu Ingest Tool')
-    parser.add_argument('--csv', required=True, help='Path to CSV file')
-    parser.add_argument('-v', '--video', required=False, help='Path to video file')
-    parser.add_argument('--push', required=True, type=str, help='Project name to push to Kitsu')
+
+    parser.add_argument('--csv', required=True, help='Path to the breakdown CSV file')
+    parser.add_argument('-v', '--video', help='Path to the breakdown video file')
+    parser.add_argument('-p', '--push', metavar='PROJECT', help='Project name to push to Kitsu')
+    parser.add_argument('-nv', '--new_version', action='store_true',
+                        help='Push as a new version (requires --push)')
+    parser.add_argument('--sequence', default='SQ01', help='Sequence name to assign to all shots')
 
     args = parser.parse_args()
 
-    ingest = KitsuIngest(args.csv, args.video, args.push)
+    if args.new_version and not args.push:
+        parser.error("--new_version requires --push to be specified")
+
+    ingest = KitsuIngest(args.csv, args.video, args.push, args.new_version, args.sequence)
     ingest.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        exit(1)

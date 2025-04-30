@@ -1,0 +1,20 @@
+[project]
+name = "kitsu-ingest"
+version = "0.1.0"
+description = "CLI tool to ingest CSV and video data into Kitsu"
+authors = [{ name = "8849", email = "dev@8849.io" }]
+requires-python = ">=3.9"
+dependencies = [
+    "pandas",
+    "ffmpeg-python",
+    "gazu",
+    "python-dotenv",
+    "argparse"
+]
+
+[project.scripts]
+kitsu-ingest = "kitsu_ingest:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
