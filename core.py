@@ -1,11 +1,12 @@
-import os
 from datetime import datetime
 import argparse
+import os
 
+from dotenv import load_dotenv
 import pandas as pd
+import logging
 import ffmpeg
 import gazu
-from dotenv import load_dotenv
 
 # USES PYTHON 3.9 AS AYON
 # NEED THE DEPENDENCIES:
@@ -14,6 +15,11 @@ from dotenv import load_dotenv
 
 TASK_TYPE_NAME = "From EVEREST"
 TASK_STATUS_NAME = "Done"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s] %(message)s'
+)
 
 
 def extract_shots(df):
@@ -56,11 +62,14 @@ def sort_dataframe(df):
 
     return df.copy()
 
+# Fetch the last modified CSV file from a directory
 def fetch_csv_from_folder(path):
     if os.path.isdir(path):
         csv_files = sorted(
-            f for f in os.listdir(path)
-            if f.lower().endswith('.csv') and os.path.isfile(os.path.join(path, f))
+            (os.path.join(path, f) for f in os.listdir(path)
+             if f.lower().endswith('.csv') and os.path.isfile(os.path.join(path, f))),
+            key=os.path.getmtime,
+            reverse=True
         )
 
         if not csv_files:
@@ -70,7 +79,6 @@ def fetch_csv_from_folder(path):
 
     else:
         raise FileNotFoundError(f"[fetch_csv_from_folder] Path does not exist: {path}")
-
 
 
 class KitsuIngest:
@@ -93,18 +101,29 @@ class KitsuIngest:
         # INIT
         self.output_dir = ""
         self.processed_csv_path = ""
+        self.timestamp = ""
 
         # PROCESSING
         if self.push_only:
            self.processed_csv_path = fetch_csv_from_folder(self.push_only)
            self.output_dir = self.push_only
-        elif self.csv_path:
+        else:
+            self.build_output_dir()
+        if self.csv_path:
             self.process_csv()
-        if self.csv_path and self.video_path:
+        if self.video_path and self.csv_path:
             self.process_video()
         # PUSHING WORKFLOW
         if self.kitsu_project:
             self.push_to_kitsu()
+
+    def build_output_dir(self):
+        self.timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        processed_dir = os.path.join(os.path.dirname(__file__), 'processed')
+        os.makedirs(processed_dir, exist_ok=True)
+        processed_dir_timestamp = os.path.join(processed_dir, self.timestamp)
+        os.makedirs(processed_dir_timestamp, exist_ok=True)
+        self.output_dir = processed_dir_timestamp
 
     def process_csv(self):
         df = self.df_obj.copy(deep=True)
@@ -126,16 +145,9 @@ class KitsuIngest:
         columns_to_keep = ['Sequence'] + list(rename_mapping.values()) + ['FPS']
         df = df[columns_to_keep]
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        processed_dir = os.path.join(os.path.dirname(__file__), 'processed')
-        os.makedirs(processed_dir, exist_ok=True)
-        processed_dir_timestamp = os.path.join(processed_dir, timestamp)
-        os.makedirs(processed_dir_timestamp, exist_ok=True)
-        self.output_dir = processed_dir_timestamp
-
         input_filename = os.path.splitext(os.path.basename(self.csv_path))[0]
-        output_filename = f"{input_filename}_kitsu_{timestamp}.csv"
-        output_path = os.path.join(processed_dir_timestamp, output_filename)
+        output_filename = f"{input_filename}_kitsu_{self.timestamp}.csv"
+        output_path = os.path.join(self.output_dir, output_filename)
         df.to_csv(output_path, index=False)
         self.processed_csv_path = output_path
 
@@ -173,9 +185,9 @@ class KitsuIngest:
                     .overwrite_output()
                     .run(quiet=True)
                 )
-                print(f"Exported: {output_path}")
+                logging.info(f"Exported: {output_path}")
             except ffmpeg.Error as e:
-                print(f"Failed to export {final_shot_name}: {e.stderr.decode()}")
+                logging.warning(f"Failed to export {final_shot_name}: {e.stderr.decode()}")
 
             last_frame = end_frame
 
@@ -186,9 +198,9 @@ class KitsuIngest:
         kitsu_password = os.getenv('KITSU_PASSWORD')
 
         if not all([kitsu_server, kitsu_email, kitsu_password]):
-            raise EnvironmentError("Missing one of KITSU_SERVER, KITSU_EMAIL, or KITSU_PASSWORD environment variables.")
+            raise EnvironmentError("Missing one of KITSU_SERVER, KITSU_EMAIL, or KITSU_PASSWORD in .env")
 
-        print(f"Connecting to Kitsu server: {kitsu_server}")
+        logging.info(f"Connecting to Kitsu server: {kitsu_server}")
         try:
             gazu.set_host(kitsu_server)
             gazu.log_in(kitsu_email, kitsu_password)
@@ -198,63 +210,64 @@ class KitsuIngest:
         try:
             project = gazu.project.get_project_by_name(self.kitsu_project)
         except gazu.exception.RouteNotFoundException as e:
-            print(f"Project '{self.kitsu_project}' not found: {e}")
+            logging.warning(f"Project '{self.kitsu_project}' not found: {e}")
             return
 
-        print("Importing shots into Kitsu...")
+        logging.info("Importing shots from CSV...")
         gazu.shot.import_shots_with_csv(project, self.processed_csv_path)
 
-        print("Fetching tasks...")
+        logging.info(f"Fetching tasks for {TASK_TYPE_NAME}...")
         task_type = gazu.task.get_task_type_by_name(TASK_TYPE_NAME)
         task_status = gazu.task.get_task_status_by_name(TASK_STATUS_NAME)
-        from_everest_tasks = gazu.task.all_tasks_for_project(project, task_type)
+        all_tasks = gazu.task.all_tasks_for_project(project, task_type)
 
         shot_task_map = {}
-        for task in from_everest_tasks:
+        for task in all_tasks:
             entity_id = task.get("entity_id")
             if not entity_id:
                 continue
-
             entity = gazu.entity.get_entity(entity_id)
-            if not entity:
+            if entity:
+                shot_task_map[entity["name"]] = task
+
+        logging.info(f"Mapped {len(shot_task_map)} shots to Kitsu tasks.")
+
+        mp4_files = [f for f in os.listdir(self.output_dir) if f.endswith(".mp4")]
+        unmatched_count = 0
+        failed_count = 0
+
+        for file_name in mp4_files:
+            shot_name = os.path.splitext(file_name)[0]
+            task = shot_task_map.get(shot_name)
+
+            if not task:
+                logging.warning(f"No matching Kitsu task found for shot: {shot_name}")
+                unmatched_count += 1
                 continue
 
-            shot_name = entity["name"]
+            video_path = os.path.join(self.output_dir, file_name)
+            logging.info(f"Publishing preview for: {shot_name}")
 
-            shot_task_map[shot_name] = task
+            try:
+                comment = gazu.task.add_comment(
+                    task=task,
+                    task_status=task_status,
+                    comment="Auto-published preview."
+                )
+                preview = gazu.task.add_preview(
+                    task=task,
+                    comment=comment,
+                    preview_file_path=video_path,
+                    normalize_movie=True
+                )
+                gazu.task.set_main_preview(preview)
+            except Exception as e:
+                logging.error(f"Failed to publish preview for {shot_name}: {e}")
+                failed_count += 1
 
-        print(f"Found {len(shot_task_map)} tasks matching shots.")
-
-        for file_name in os.listdir(self.output_dir):
-            if file_name.endswith(".mp4"):
-                shot_base_name = os.path.splitext(file_name)[0] # remove ext
-                task = shot_task_map.get(shot_base_name)
-
-                if task:
-                    video_path = os.path.join(self.output_dir, file_name)
-
-                    try:
-                        print(f"Publishing preview for shot '{shot_base_name}'...")
-
-                        comment = gazu.task.add_comment(
-                            task=task,
-                            task_status=task_status,
-                            comment="Auto-published preview."
-                        )
-
-                        preview = gazu.task.add_preview(
-                            task=task,
-                            comment=comment,
-                            preview_file_path=video_path,
-                            normalize_movie=True
-                        )
-
-                        gazu.task.set_main_preview(preview)
-
-                    except Exception as e:
-                        print(f"Warning: Failed to publish preview for {shot_base_name}: {e}")
-                else:
-                    print(f"Warning: No matching task found for {shot_base_name}")
+        logging.info(f"Finished publishing previews.")
+        logging.info(f"Matched: {len(mp4_files) - unmatched_count - failed_count}, "
+                     f"Unmatched: {unmatched_count}, Failed: {failed_count}")
 
     def close(self):
         info = "Ingestion complete."
@@ -264,13 +277,13 @@ class KitsuIngest:
             info += f" Processed video file."
         if self.kitsu_project:
             info += f" Pushed to Kitsu project '{self.kitsu_project}'."
-        print(info)
+        logging.info(info)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Kitsu Ingest Tool')
 
-    parser.add_argument('--csv', required=True, help='Path to the breakdown CSV file')
+    parser.add_argument('--csv', help='Path to the breakdown CSV file')
     parser.add_argument('-v', '--video', help='Path to the breakdown video file')
     parser.add_argument('-p', '--push', metavar='PROJECT', help='Project name to push to Kitsu')
     parser.add_argument('--push_only', help='Push a folder (path) containing CSV and videos to Kitsu')
@@ -278,13 +291,25 @@ def main():
 
     args = parser.parse_args()
 
-    if args.push_only and (args.csv or args.video):
-        parser.error("--push_only can only be used with --push PROJECT and --sequence NAME arguments")
+    if args.push_only:
+        if args.csv or args.video:
+            parser.error("--push_only cannot be used with --csv or --video")
+        if not args.push:
+            parser.error("--push_only requires --push PROJECT argument")
 
-    if args.push_only and not args.push:
-        parser.error("--push_only requires --push PROJECT argument")
+    if args.video and not args.csv:
+        parser.error("--video requires --csv to define shots and frame ranges")
 
-    ingest = KitsuIngest(args.csv, args.video, args.push, args.push_only, args.sequence)
+    if not any([args.csv, args.video, args.push_only]):
+        parser.error("You must provide at least one of --csv, --csv + --video, or --push_only")
+
+    ingest = KitsuIngest(
+        csv_path=args.csv,
+        video_path=args.video,
+        project_name=args.push,
+        sequence=args.sequence,
+        push_only=args.push_only,
+    )
     ingest.close()
 
 
@@ -292,5 +317,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"[ERROR] {e}")
+        logging.error(f"{e}")
         exit(1)
