@@ -1,4 +1,3 @@
-# Import key components for easier access
 from .auth import kitsu_login
 from .publisher import KitsuPublisher
 
