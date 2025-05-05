@@ -135,24 +135,27 @@ def safety_check_kitsu_vs_local_mp4(kitsu_data, mp4_files):
 
 def safety_check_matching_metadata(kitsu_data, local_data):
     mismatches = {}
-    for name, csv_data in local_data.items():
-        shot = kitsu_data.get(name)
-        if not shot:
-            mismatches[name] = {"error": "Missing in Kitsu shots"}
+
+    for shot_name, csv_data in local_data.items():
+        kitsu_shot = kitsu_data.get(shot_name)
+        if not kitsu_shot:
+            mismatches[shot_name] = {"error": "Missing in Kitsu shots"}
             continue
 
-        diffs = {
-            k: {"csv": v, "kitsu": shot[k]}
-            for k, v in csv_data.items()
-            if (
-                isinstance(v, float) and not abs(v - shot[k]) < 1e-3
-            ) or (
-                not isinstance(v, float) and v != shot[k]
-            )
-        }
+        # Compare each metadata field between CSV and Kitsu
+        differences = {}
+        for field_name, csv_value in csv_data.items():
+            kitsu_value = kitsu_shot[field_name]
 
-        if diffs:
-            mismatches[name] = diffs
+            if isinstance(csv_value, float):
+                if abs(csv_value - kitsu_value) >= 1e-3:
+                    differences[field_name] = {"csv": csv_value, "kitsu": kitsu_value}
+
+            elif csv_value != kitsu_value:
+                differences[field_name] = {"csv": csv_value, "kitsu": kitsu_value}
+
+        if differences:
+            mismatches[shot_name] = differences
 
     for name in kitsu_data:
         if name not in local_data:
@@ -423,7 +426,7 @@ def main():
         parser.error("--video requires --csv to define shots and frame ranges")
 
     if not any([args.csv, args.video, args.push_only]):
-        parser.error("You must provide at least one of --csv, --csv + --video, or --push_only")
+        parser.error("You must provide at least one of --csv, --csv + --video, or --push_only + --push")
 
     ingest = KitsuIngest(
         csv_path=args.csv,
