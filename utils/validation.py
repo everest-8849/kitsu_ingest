@@ -151,7 +151,6 @@ def safety_check_matching_metadata(kitsu_data, local_data):
         if name not in local_data:
             mismatches[name] = {"error": "Missing in CSV shots"}
 
-    # Summary
     if mismatches:
         logging.warning("Metadata mismatches detected:")
         for name, diff in mismatches.items():
