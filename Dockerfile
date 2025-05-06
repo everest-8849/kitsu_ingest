@@ -24,7 +24,7 @@ COPY .env /app/
 RUN pip install --no-cache-dir .
 
 # Create processed directory with proper permissions
-RUN mkdir -p /app/kitsu_ingest/processed && chown -R kitsu:kitsu /app
+RUN mkdir -p /app/kitsu_ingest/processed && chmod 777 /app/kitsu_ingest/processed
 
 # Make the Python module available as a command
 RUN echo '#!/bin/bash\npython -m kitsu_ingest "$@"' > /usr/local/bin/kitsu-ingest && \
@@ -33,8 +33,8 @@ RUN echo '#!/bin/bash\npython -m kitsu_ingest "$@"' > /usr/local/bin/kitsu-inges
 # Switch to non-root user
 USER kitsu
 
-# Define volume for processed data
-VOLUME ["/app/processed"]
+# Define volume for processed data - use the correct path
+VOLUME ["/app/kitsu_ingest/processed"]
 
 # Use shell as entrypoint
 CMD ["/bin/bash"]
