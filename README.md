@@ -1,4 +1,4 @@
-                 # Kitsu Ingest Docker Scripts Documentation
+# Kitsu Ingest Docker Scripts Documentation
 
 ## Overview
 
