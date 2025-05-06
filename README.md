@@ -7,7 +7,7 @@ This documentation covers the Docker scripts used to process and upload data to 
 ## Prerequisites
 
 - Docker installed and running
-- use `build_docker.sh` to build Docker image
+- use `build_docker.sh` to build Docker image ('chmod +x' if not already executable)
 - Appropriate permissions to execute scripts and access files
 
 ## Scripts
