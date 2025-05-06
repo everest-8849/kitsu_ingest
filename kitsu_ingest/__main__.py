@@ -1,4 +1,4 @@
-from kitsu_ingest import main
+from .core import main
 
 if __name__ == "__main__":
     try:
